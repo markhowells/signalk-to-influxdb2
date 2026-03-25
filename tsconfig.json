@@ -5,6 +5,7 @@
     "rootDir": "src",
     "outDir": "./dist",
     "strict": true,
+    "skipLibCheck": true,
     "resolveJsonModule": true,
     "esModuleInterop": true,
     "typeRoots": ["./src", "./node_modules/@types"],

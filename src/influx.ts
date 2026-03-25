@@ -44,6 +44,28 @@ interface FilteringRule {
   source: string
 }
 
+/**
+ * Configuration for promoting a SK path's value to an InfluxDB tag.
+ * The path's value is cached and applied as a tag on every point written.
+ */
+interface TagPathConfig {
+  /**
+   * @title SK path
+   * @description The SignalK path whose current value should be used as a tag (e.g. vessels.self.sails.active)
+   */
+  path: string
+  /**
+   * @title Tag name
+   * @description The InfluxDB tag name to write (e.g. sail_config)
+   */
+  tagName: string
+  /**
+   * @title Default value
+   * @description Value to use before the path receives its first update. If omitted, no tag is written until the first update arrives.
+   */
+  defaultValue?: string
+}
+
 export interface SKInfluxConfig {
   /**
    * Url of the InfluxDb 2 server
@@ -109,6 +131,24 @@ export interface SKInfluxConfig {
    */
   resolution: number
 
+  /**
+   * @title Tag paths
+   * @default []
+   * @description SK paths whose current values are maintained as tags on every point written.
+   * Use this to tag all data with slowly-changing state such as the active sail configuration.
+   * Example: [{ "path": "vessels.self.sails.active", "tagName": "sail_config", "defaultValue": "unknown" }]
+   */
+  tagPaths?: TagPathConfig[]
+
+  /**
+   * @title Consolidated measurement name
+   * @description When set, all values are written to this single InfluxDB measurement using the SK path
+   * as the field name, rather than one measurement per path. Makes analytics queries much simpler.
+   * Example: "instruments"
+   * Note: object-type values (notifications, JSON blobs) are skipped in consolidated mode.
+   */
+  consolidatedMeasurement?: string
+
   writeOptions: Partial<WriteOptions>
 }
 
@@ -156,6 +196,13 @@ export class SKInflux {
   } = {}
   private resolution: number
 
+  // Tag path support: cache of path → { tagName, current value }
+  private tagPathsConfig: TagPathConfig[]
+  private tagCache: Map<string, { tagName: string; value: string }> = new Map()
+
+  // Consolidated measurement support
+  private consolidatedMeasurement: string | undefined
+
   constructor(config: SKInfluxConfig, private logging: Logging, triggerStatusUpdate: () => void) {
     const { org, bucket, url, onlySelf, ignoredPaths, ignoredSources, resolution, useSKTimestamp, filteringRules } =
       config
@@ -169,6 +216,18 @@ export class SKInflux {
     this.filteringRules = filteringRules || []
     this.useSKTimestamp = useSKTimestamp
     this.resolution = resolution
+
+    // Initialise tag path support
+    this.tagPathsConfig = config.tagPaths || []
+    this.tagPathsConfig.forEach(({ path, tagName, defaultValue }) => {
+      if (defaultValue !== undefined) {
+        this.tagCache.set(path, { tagName, value: defaultValue })
+      }
+    })
+
+    // Initialise consolidated measurement support
+    this.consolidatedMeasurement = config.consolidatedMeasurement
+
     this.writeApi = this.influx.getWriteApi(org, bucket, 'ms', {
       ...config.writeOptions,
       // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -247,6 +306,15 @@ export class SKInflux {
     }
   }
 
+  /**
+   * Apply all cached tag path values as tags on the given point.
+   */
+  private applyTagCache(point: Point): void {
+    this.tagCache.forEach(({ tagName, value }) => {
+      point.tag(tagName, value)
+    })
+  }
+
   handleValue(
     context: Context,
     isSelf: boolean,
@@ -261,6 +329,16 @@ export class SKInflux {
     if (!this.shouldStoreNow(context, pathValue.path, sourceRef, now)) {
       return
     }
+
+    // Update tag cache if this is a configured tag path
+    const tagPathConfig = this.tagPathsConfig.find((tc) => tc.path === pathValue.path)
+    if (tagPathConfig && pathValue.value !== null && pathValue.value !== undefined) {
+      this.tagCache.set(pathValue.path, {
+        tagName: tagPathConfig.tagName,
+        value: String(pathValue.value),
+      })
+    }
+
     if (!this.onlySelf || isSelf) {
       this.toPoints(context, isSelf, sourceRef, timestamp, pathValue, this.logging.debug).forEach((point) => {
         this.writeApi.writePoint(point)
@@ -379,7 +457,12 @@ export class SKInflux {
     pathValue: PathValue,
     debug: (s: string) => void,
   ): Point[] {
-    const point = new Point(influxPath(pathValue.path)).tag('context', context).tag('source', source)
+    // When consolidatedMeasurement is set, all values go to that measurement
+    // with the SK path as the field name. Otherwise, use the SK path as the
+    // measurement name and 'value' as the field name (original behaviour).
+    const measurementName = this.consolidatedMeasurement ?? influxPath(pathValue.path)
+
+    const point = new Point(measurementName).tag('context', context).tag('source', source)
     if (this.useSKTimestamp) {
       point.timestamp(timestamp !== undefined ? new Date(timestamp) : new Date())
     }
@@ -389,44 +472,71 @@ export class SKInflux {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const value = pathValue.value as any
     if (isValidPosition(pathValue)) {
+      // Position is always split into lat/lon fields regardless of mode
       point.floatField('lat', value.latitude)
       point.floatField('lon', value.longitude)
       point.tag('s2_cell_id', posToS2CellId(value))
     } else if (pathValue.path === 'navigation.attitude') {
-      return ['pitch', 'roll', 'yaw'].reduce<Point[]>((acc, field) => {
-        if (isValidFloat(value[field])) {
-          const point = new Point(influxPath(`navigation.attitude.${field}`))
-            .tag('context', context)
-            .tag('source', source)
-          point.floatField('value', value[field])
-          acc.push(point)
-        }
-        return acc
-      }, [])
+      if (this.consolidatedMeasurement) {
+        // Consolidated mode: all attitude components as fields on one point
+        let hasField = false
+        ;['pitch', 'roll', 'yaw'].forEach((field) => {
+          if (isValidFloat(value[field])) {
+            point.floatField(`navigation.attitude.${field}`, value[field])
+            hasField = true
+          }
+        })
+        if (!hasField) return []
+        this.applyTagCache(point)
+        return [point]
+      } else {
+        // Original behaviour: one measurement per attitude component
+        return ['pitch', 'roll', 'yaw'].reduce<Point[]>((acc, field) => {
+          if (isValidFloat(value[field])) {
+            const attPoint = new Point(influxPath(`navigation.attitude.${field}`))
+              .tag('context', context)
+              .tag('source', source)
+            if (isSelf) attPoint.tag(SELF_TAG_NAME, SELF_TAG_VALUE)
+            attPoint.floatField('value', value[field])
+            this.applyTagCache(attPoint)
+            acc.push(attPoint)
+          }
+          return acc
+        }, [])
+      }
     } else {
       const valueType = typeFor(pathValue)
       if (value === null) {
         return []
       }
+      // In consolidated mode, use the SK path as the field name.
+      // In original mode, always use 'value'.
+      const fieldName = this.consolidatedMeasurement ? pathValue.path : 'value'
       try {
         switch (valueType) {
           case JsValueType.number:
-            point.floatField('value', value)
+            point.floatField(fieldName, value)
             break
           case JsValueType.string:
-            point.stringField('value', value)
+            point.stringField(fieldName, value)
             break
           case JsValueType.boolean:
-            point.booleanField('value', value)
+            point.booleanField(fieldName, value)
             break
           case JsValueType.object:
-            point.stringField('value', JSON.stringify(value))
+            if (this.consolidatedMeasurement) {
+              // Skip object values in consolidated mode: JSON blobs and
+              // notifications pollute an analytics measurement.
+              return []
+            }
+            point.stringField(fieldName, JSON.stringify(value))
         }
       } catch (e) {
         debug(`Error creating point ${pathValue.path}:${pathValue.value} => ${valueType}`)
         return []
       }
     }
+    this.applyTagCache(point)
     return [point]
   }
 }

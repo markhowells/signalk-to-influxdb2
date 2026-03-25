@@ -103,6 +103,46 @@ export const PluginConfigSchema = {
               'Time resolution of data written to the database. Zero means write all data, 1000 means write each context-path-source combination once per second. Updates arriving more quicker will not be written.',
             type: 'number',
           },
+          tagPaths: {
+            title: 'Tag paths',
+            default: [],
+            description:
+              'SK paths whose current values are maintained as tags on every point written. ' +
+              'Use this to tag all instrument data with slowly-changing state such as the active sail configuration. ' +
+              'Example: set path to "vessels.self.sails.active", tagName to "sail_config", defaultValue to "unknown".',
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['path', 'tagName'],
+              properties: {
+                path: {
+                  title: 'SK path',
+                  description: 'The SignalK path whose value to use as a tag (e.g. vessels.self.sails.active)',
+                  type: 'string',
+                },
+                tagName: {
+                  title: 'Tag name',
+                  description: 'The InfluxDB tag name to write (e.g. sail_config)',
+                  type: 'string',
+                },
+                defaultValue: {
+                  title: 'Default value',
+                  description:
+                    'Value to use before the path receives its first update. If omitted, no tag is written until the first update arrives.',
+                  type: 'string',
+                },
+              },
+            },
+          },
+          consolidatedMeasurement: {
+            title: 'Consolidated measurement name',
+            description:
+              'When set, all values are written to this single InfluxDB measurement using the SK path as the ' +
+              'field name, rather than one measurement per path. Makes analytics and polar generation queries ' +
+              'much simpler. Recommended value: "instruments". ' +
+              'Note: object-type values (notifications, JSON blobs) are skipped in consolidated mode.',
+            type: 'string',
+          },
           writeOptions: {
             type: 'object',
             properties: {
