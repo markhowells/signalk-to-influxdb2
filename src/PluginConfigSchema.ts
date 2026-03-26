@@ -137,9 +137,11 @@ export const PluginConfigSchema = {
           consolidatedMeasurement: {
             title: 'Consolidated measurement name',
             description:
-              'When set, all values are written to this single InfluxDB measurement using the SK path as the ' +
-              'field name, rather than one measurement per path. Makes analytics and polar generation queries ' +
-              'much simpler. Recommended value: "instruments". ' +
+              'EITHER/OR with per-path mode: when set, values are written ONLY to this single InfluxDB measurement ' +
+              'using the SK path as the field name — per-path measurements are NOT written. ' +
+              'To use both modes simultaneously, add a second entry in the influxes array pointing at the same server. ' +
+              'Makes analytics and polar generation queries much simpler — no pivot/join across many measurements. ' +
+              'Recommended value: "instruments". ' +
               'Note: object-type values (notifications, JSON blobs) are skipped in consolidated mode.',
             type: 'string',
           },
