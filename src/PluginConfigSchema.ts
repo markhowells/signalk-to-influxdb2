@@ -109,7 +109,7 @@ export const PluginConfigSchema = {
             description:
               'SK paths whose current values are maintained as tags on every point written. ' +
               'Use this to tag all instrument data with slowly-changing state such as the active sail configuration. ' +
-              'Example: set path to "vessels.self.sails.active", tagName to "sail_config", defaultValue to "unknown".',
+              'Example: set path to "sails.inventory.main.active", tagName to "sail_config", defaultValue to "unknown".',
             type: 'array',
             items: {
               type: 'object',
@@ -117,7 +117,7 @@ export const PluginConfigSchema = {
               properties: {
                 path: {
                   title: 'SK path',
-                  description: 'The SignalK path whose value to use as a tag (e.g. vessels.self.sails.active)',
+                  description: 'The SignalK path whose value to use as a tag (e.g. sails.inventory.main.active)',
                   type: 'string',
                 },
                 tagName: {
@@ -131,6 +131,35 @@ export const PluginConfigSchema = {
                     'Value to use before the path receives its first update. If omitted, no tag is written until the first update arrives.',
                   type: 'string',
                 },
+              },
+            },
+          },
+          sailInventoryTag: {
+            title: 'Sail inventory tag',
+            description:
+              'Builds a canonical sail_config tag from sails.inventory.*.active booleans. ' +
+              'Active sail names are sorted alphabetically and joined with "+" (e.g. "jib+main") so the ' +
+              'tag value is stable regardless of update order. ' +
+              'Example: set tagName to "sail_config", defaultValue to "unknown".',
+            type: 'object',
+            required: ['enabled', 'tagName'],
+            properties: {
+              enabled: {
+                title: 'Enabled',
+                description: 'Enable or disable sail inventory tag derivation.',
+                type: 'boolean',
+                default: true,
+              },
+              tagName: {
+                title: 'Tag name',
+                description: 'The InfluxDB tag name to write (e.g. sail_config)',
+                type: 'string',
+              },
+              defaultValue: {
+                title: 'Default value',
+                description:
+                  'Value to use before any sails.inventory.*.active updates arrive. If omitted, no tag is written until the first update.',
+                type: 'string',
               },
             },
           },

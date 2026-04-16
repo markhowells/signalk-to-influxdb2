@@ -51,7 +51,7 @@ interface FilteringRule {
 interface TagPathConfig {
   /**
    * @title SK path
-   * @description The SignalK path whose current value should be used as a tag (e.g. vessels.self.sails.active)
+   * @description The SignalK path whose current value should be used as a tag (e.g. sails.inventory.main.active)
    */
   path: string
   /**
@@ -62,6 +62,30 @@ interface TagPathConfig {
   /**
    * @title Default value
    * @description Value to use before the path receives its first update. If omitted, no tag is written until the first update arrives.
+   */
+  defaultValue?: string
+}
+
+/**
+ * Configuration for building a canonical sail_config tag from sails.inventory.*.active booleans.
+ * Active sail names are sorted alphabetically and joined with '+' to produce a stable tag value
+ * regardless of the order in which updates arrive (e.g. "jib+main" rather than "main+jib").
+ */
+interface SailInventoryTagConfig {
+  /**
+   * @title Enabled
+   * @description Enable or disable sail inventory tag derivation.
+   * @default true
+   */
+  enabled: boolean
+  /**
+   * @title Tag name
+   * @description The InfluxDB tag name to write (e.g. sail_config)
+   */
+  tagName: string
+  /**
+   * @title Default value
+   * @description Value to use before any sails.inventory.*.active updates arrive.
    */
   defaultValue?: string
 }
@@ -136,9 +160,19 @@ export interface SKInfluxConfig {
    * @default []
    * @description SK paths whose current values are maintained as tags on every point written.
    * Use this to tag all data with slowly-changing state such as the active sail configuration.
-   * Example: [{ "path": "vessels.self.sails.active", "tagName": "sail_config", "defaultValue": "unknown" }]
+   * Example: [{ "path": "sails.inventory.main.active", "tagName": "sail_config", "defaultValue": "unknown" }]
    */
   tagPaths?: TagPathConfig[]
+
+  /**
+   * @title Sail inventory tag
+   * @description Builds a canonical sail_config tag from sails.inventory.*.active booleans.
+   * Active sail names are sorted alphabetically and joined with '+' (e.g. "jib+main") so the
+   * tag value is stable regardless of update order. Mutually exclusive with using tagPaths for
+   * sail configuration.
+   * Example: { "tagName": "sail_config", "defaultValue": "unknown" }
+   */
+  sailInventoryTag?: SailInventoryTagConfig
 
   /**
    * @title Consolidated measurement name
@@ -200,6 +234,10 @@ export class SKInflux {
   private tagPathsConfig: TagPathConfig[]
   private tagCache: Map<string, { tagName: string; value: string }> = new Map()
 
+  // Sail inventory tag support
+  private sailInventoryTagConfig: SailInventoryTagConfig | undefined
+  private activeSails: Set<string> = new Set()
+
   // Consolidated measurement support
   private consolidatedMeasurement: string | undefined
 
@@ -224,6 +262,27 @@ export class SKInflux {
         this.tagCache.set(path, { tagName, value: defaultValue })
       }
     })
+
+    // Initialise sail inventory tag support
+    this.sailInventoryTagConfig = config.sailInventoryTag
+    if (this.sailInventoryTagConfig) {
+      const cfg = this.sailInventoryTagConfig
+      if (cfg.enabled === false) {
+        this.logging.debug(`[sailInventoryTag] disabled in config — no sail_config tag will be written`)
+      } else {
+        this.logging.debug(
+          `[sailInventoryTag] enabled — watching sails.inventory.*.active, tagName="${cfg.tagName}", defaultValue="${cfg.defaultValue ?? '(none)'}"`
+        )
+        if (cfg.defaultValue !== undefined) {
+          this.tagCache.set('__sailInventory__', {
+            tagName: cfg.tagName,
+            value: cfg.defaultValue,
+          })
+        }
+      }
+    } else {
+      this.logging.debug(`[sailInventoryTag] not configured — no sail_config tag will be written`)
+    }
 
     // Initialise consolidated measurement support
     this.consolidatedMeasurement = config.consolidatedMeasurement
@@ -337,6 +396,31 @@ export class SKInflux {
         tagName: tagPathConfig.tagName,
         value: String(pathValue.value),
       })
+    }
+
+    // Update sail inventory tag if this is a sails.inventory.*.active path
+    if (this.sailInventoryTagConfig && this.sailInventoryTagConfig.enabled !== false) {
+      const match = pathValue.path.match(/^sails\.inventory\.([^.]+)\.active$/)
+      if (match) {
+        const sailName = match[1]
+        const before = new Set(this.activeSails)
+        if (pathValue.value === true) {
+          this.activeSails.add(sailName)
+        } else {
+          this.activeSails.delete(sailName)
+        }
+        const combined =
+          this.activeSails.size > 0
+            ? [...this.activeSails].sort().join('+')
+            : (this.sailInventoryTagConfig.defaultValue ?? 'none')
+        this.tagCache.set('__sailInventory__', {
+          tagName: this.sailInventoryTagConfig.tagName,
+          value: combined,
+        })
+        this.logging.debug(
+          `[sailInventoryTag] ${pathValue.path} = ${pathValue.value} | activeSails: [${[...before].sort().join(', ')}] → [${[...this.activeSails].sort().join(', ')}] | tag ${this.sailInventoryTagConfig.tagName}="${combined}"`
+        )
+      }
     }
 
     if (!this.onlySelf || isSelf) {
