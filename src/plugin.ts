@@ -20,9 +20,18 @@ import { IRouter } from 'express'
 import { Context, Delta, hasValues, MetaDelta, Path, PathValue, SourceRef, ValuesDelta } from '@signalk/server-api'
 import { HistoryApiRegistry } from '@signalk/server-api/history'
 import { PluginConfigSchema } from './PluginConfigSchema'
+import semver from 'semver'
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const packageInfo = require('../package.json')
+
+// Minimum Signal K server version that emits the `unfilteredDelta` event
+const UNFILTERED_DELTA_MIN_VERSION = '2.28.0'
+
+// Whether the server is recent enough to emit the `unfilteredDelta` event needed by sourcePolicy 'all'
+function serverSupportsUnfilteredDelta(app: App): boolean {
+  return semver.gte(semver.coerce(app.config.version) ?? '0.0.0', UNFILTERED_DELTA_MIN_VERSION)
+}
 
 export interface Logging {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -34,13 +43,16 @@ export interface App extends Logging, Pick<IRouter, 'get'>, HistoryApiRegistry {
   handleMessage(id: string, delta: Delta): void
   signalk: EventEmitter
   selfId: string
+  config: {
+    version: string
+  }
   setPluginStatus: (msg: string) => void
 }
 
 export interface Plugin {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   start: (c: PluginConfig) => Promise<unknown>
-  stop: () => void
+  stop: () => void | Promise<unknown>
   // signalKApiRoutes: (r: Router) => Router
   id: string
   name: string
@@ -64,15 +76,21 @@ export interface InfluxPlugin {
 
 export interface PluginConfig {
   outputDailyLog: boolean
+  sourcePolicy?: 'preferred' | 'all'
   influxes: SKInfluxConfig[]
 }
 
 export default function InfluxPluginFactory(app: App): Plugin & InfluxPlugin {
-  const schema = PluginConfigSchema
+  const schema = JSON.parse(JSON.stringify(PluginConfigSchema))
+  if (!serverSupportsUnfilteredDelta(app)) {
+    // sourcePolicy 'all' relies on the server's `unfilteredDelta` event, added in 2.28.0
+    delete schema.properties.sourcePolicy
+  }
   const selfContext = 'vessels.' + app.selfId
 
   let skInfluxes: SKInflux[] = []
   let onStop: (() => void)[] = []
+  const flush = () => Promise.all(skInfluxes.map((ski) => ski.flush()))
   return {
     start: function (config: PluginConfig) {
       const updatePluginStatus = () => {
@@ -89,7 +107,7 @@ export default function InfluxPluginFactory(app: App): Plugin & InfluxPlugin {
       const historyProvider = new InfluxHistoryProvider(skInfluxes[0], app.selfId, app.debug)
       app.registerHistoryApiProvider(historyProvider)
 
-      onStop = []
+      onStop = [() => app.unregisterHistoryApiProvider()]
       skInfluxes.forEach((skInflux) => {
         const pruner = setInterval(() => skInflux.pruneLastWrittenTimestamps(), 5 * 60 * 1000)
         onStop.push(() => clearInterval(pruner))
@@ -161,18 +179,33 @@ export default function InfluxPluginFactory(app: App): Plugin & InfluxPlugin {
                 })
             })
         }
-        app.signalk.on('delta', onDelta)
-        onStop.push(() => app.signalk.removeListener('delta', onDelta))
+        let deltaEvent = 'delta'
+        if (config.sourcePolicy === 'all') {
+          if (serverSupportsUnfilteredDelta(app)) {
+            deltaEvent = 'unfilteredDelta'
+          } else {
+            app.error(
+              `sourcePolicy 'all' requires Signal K server >= ${UNFILTERED_DELTA_MIN_VERSION}, ` +
+                `but server version is ${app.config.version}. Falling back to 'preferred'.`,
+            )
+          }
+        }
+        app.signalk.on(deltaEvent, onDelta)
+        onStop.push(() => app.signalk.removeListener(deltaEvent, onDelta))
       })
     },
 
-    // eslint-disable-next-line @typescript-eslint/no-empty-function
     stop: () => {
       onStop.forEach((f) => f())
       onStop = []
+      // Without this, any points still sitting in the write client's
+      // buffer (it batches by default, see getWriteApi) are lost if the
+      // process exits before the write client's own flush timer fires --
+      // e.g. the whole Signal K server process being restarted.
+      return Promise.all(skInfluxes.map((ski) => ski.close()))
     },
 
-    flush: () => Promise.all(skInfluxes.map((ski) => ski.flush())),
+    flush,
 
     getValues: (params: QueryParams) => skInfluxes[0].getValues(params),
     getSelfValues: (params: Omit<QueryParams, 'context'>) => skInfluxes[0].getSelfValues(params),

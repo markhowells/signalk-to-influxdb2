@@ -3,11 +3,11 @@ import { EventEmitter } from 'stream'
 import InfluxPluginFactory, { App, InfluxPlugin, Plugin } from './plugin'
 import waitOn from 'wait-on'
 import retry from 'async-await-retry'
-import { influxPath } from './influx'
+import { influxPath, bucketToV1DatabaseName } from './influx'
 import { Context, Path, PathValue } from '@signalk/server-api'
 import { getValues, InfluxHistoryProvider } from './HistoryAPI'
 import { ZoneId, ZonedDateTime } from '@js-joda/core'
-import { ValuesResponse } from '@signalk/server-api/history'
+import { ValuesRequest, ValuesResponse } from '@signalk/server-api/history'
 import { Temporal } from '@js-temporal/polyfill'
 
 const INFLUX_HOST = process.env['INFLUX_HOST'] || '127.0.0.1'
@@ -21,6 +21,8 @@ const TESTCONTEXT = `vessels.${selfId}`
 const MMSICONTEXT = 'vessels.urn:mrn:imo:mmsi:200000000'
 
 describe('Plugin', () => {
+  let unregisterHistoryApiProviderCallCount = 0
+
   const app: App = {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars
     debug: function (...args: any): void {
@@ -34,6 +36,9 @@ describe('Plugin', () => {
     },
     signalk: new EventEmitter(),
     selfId,
+    config: {
+      version: '2.28.0',
+    },
     setPluginStatus: (s: string) => console.log(s),
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
@@ -43,7 +48,7 @@ describe('Plugin', () => {
       // Mock implementation for tests
     },
     unregisterHistoryApiProvider: () => {
-      // Mock implementation for tests
+      unregisterHistoryApiProviderCallCount++
     },
   }
 
@@ -534,6 +539,328 @@ describe('Plugin', () => {
           interval: 50,
         },
       )
+    })
+
+    it('Filters numeric values by sourceRef given after a pipe', async () => {
+      const base = new Date('2023-02-01T00:00:00.000Z')
+      const stepMs = 10_000
+      const count = 5
+      const SOURCE_A = 'source.a'
+      const SOURCE_B = 'source.b'
+
+      for (let i = 0; i < count; i++) {
+        const ts = new Date(base.getTime() + i * stepMs)
+        ;[
+          { source: SOURCE_A, value: 100 + i },
+          { source: SOURCE_B, value: 200 + i },
+        ].forEach(({ source, value }) =>
+          app.signalk.emit('delta', {
+            context: TESTCONTEXT,
+            updates: [
+              {
+                $source: source,
+                timestamp: ts,
+                values: [{ path: 'navigation.speedThroughWater' as Path, value }],
+              },
+            ],
+          }),
+        )
+      }
+
+      await plugin.flush()
+
+      const from = ZonedDateTime.parse('2023-02-01T00:00:00Z')
+      const to = ZonedDateTime.parse('2023-02-01T00:05:00Z')
+
+      return retry(
+        () =>
+          new Promise<ValuesResponse>((resolve) => {
+            getValues(
+              plugin.skInfluxes()[0],
+              TESTCONTEXT as Context,
+              from,
+              to,
+              '',
+              () => undefined,
+              {
+                query: {
+                  paths: `navigation.speedThroughWater:max|${SOURCE_A}`,
+                  resolution: '10',
+                },
+              },
+              {
+                send: () => {
+                  throw new Error('send called')
+                },
+                header: () => {
+                  throw new Error('header called')
+                },
+                status: () => undefined,
+                json: (r) => resolve(r),
+              },
+            )
+          }).then((result) => {
+            expect(result.values).to.deep.equal([
+              { path: 'navigation.speedThroughWater', method: 'max', $source: SOURCE_A },
+            ])
+            expect(result.data.length).to.equal(count)
+            result.data.forEach((row, i) => {
+              expect(row[1]).to.equal(100 + i)
+            })
+          }),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('Returns numeric values split by source when sourcePolicy is all', async () => {
+      const base = new Date('2023-02-02T00:00:00.000Z')
+      const stepMs = 10_000
+      const count = 5
+      const SOURCE_A = 'source.a'
+      const SOURCE_B = 'source.b'
+
+      for (let i = 0; i < count; i++) {
+        const ts = new Date(base.getTime() + i * stepMs)
+        ;[
+          { source: SOURCE_A, value: 100 + i },
+          { source: SOURCE_B, value: 200 + i },
+        ].forEach(({ source, value }) =>
+          app.signalk.emit('delta', {
+            context: TESTCONTEXT,
+            updates: [
+              {
+                $source: source,
+                timestamp: ts,
+                values: [{ path: 'navigation.speedThroughWater' as Path, value }],
+              },
+            ],
+          }),
+        )
+      }
+
+      await plugin.flush()
+
+      const historyProvider = new InfluxHistoryProvider(plugin.skInfluxes()[0], selfId, app.debug)
+      const query = {
+        from: Temporal.Instant.from('2023-02-02T00:00:00Z'),
+        to: Temporal.Instant.from('2023-02-02T00:05:00Z'),
+        context: TESTCONTEXT as Context,
+        resolution: 10,
+        sourcePolicy: 'all' as const,
+        pathSpecs: [
+          {
+            path: 'navigation.speedThroughWater' as Path,
+            aggregate: 'max' as const,
+            parameter: [],
+          },
+        ],
+      }
+
+      return retry(
+        () =>
+          historyProvider.getValues(query).then((result) => {
+            expect(result.values).to.deep.equal([
+              { path: 'navigation.speedThroughWater', method: 'max', $source: SOURCE_A },
+              { path: 'navigation.speedThroughWater', method: 'max', $source: SOURCE_B },
+            ])
+            expect(result.data.length).to.equal(count)
+            result.data.forEach((row, i) => {
+              expect(row[1]).to.equal(100 + i)
+              expect(row[2]).to.equal(200 + i)
+            })
+          }),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('Returns multiple numeric paths split by source when sourcePolicy is all', async () => {
+      const base = new Date('2023-02-04T00:00:00.000Z')
+      const stepMs = 10_000
+      const count = 5
+      const SOURCE_A = 'source.a'
+      const SOURCE_B = 'source.b'
+
+      for (let i = 0; i < count; i++) {
+        const ts = new Date(base.getTime() + i * stepMs)
+        ;[
+          {
+            source: SOURCE_A,
+            heading: 100 + i,
+            speed: 10 + i,
+          },
+          {
+            source: SOURCE_B,
+            heading: 200 + i,
+            speed: 20 + i,
+          },
+        ].forEach(({ source, heading, speed }) =>
+          app.signalk.emit('delta', {
+            context: TESTCONTEXT,
+            updates: [
+              {
+                $source: source,
+                timestamp: ts,
+                values: [
+                  { path: 'navigation.headingMagnetic' as Path, value: heading },
+                  { path: 'navigation.speedThroughWater' as Path, value: speed },
+                ],
+              },
+            ],
+          }),
+        )
+      }
+
+      await plugin.flush()
+
+      const historyProvider = new InfluxHistoryProvider(plugin.skInfluxes()[0], selfId, app.debug)
+      const query = {
+        from: Temporal.Instant.from('2023-02-04T00:00:00Z'),
+        to: Temporal.Instant.from('2023-02-04T00:05:00Z'),
+        context: TESTCONTEXT as Context,
+        resolution: 10,
+        sourcePolicy: 'all' as const,
+        pathSpecs: [
+          {
+            path: 'navigation.headingMagnetic' as Path,
+            aggregate: 'max' as const,
+            parameter: [],
+          },
+          {
+            path: 'navigation.speedThroughWater' as Path,
+            aggregate: 'max' as const,
+            parameter: [],
+          },
+        ],
+      }
+
+      return retry(
+        () =>
+          historyProvider.getValues(query).then((result) => {
+            expect(result.values).to.deep.equal([
+              { path: 'navigation.headingMagnetic', method: 'max', $source: SOURCE_A },
+              { path: 'navigation.headingMagnetic', method: 'max', $source: SOURCE_B },
+              { path: 'navigation.speedThroughWater', method: 'max', $source: SOURCE_A },
+              { path: 'navigation.speedThroughWater', method: 'max', $source: SOURCE_B },
+            ])
+            expect(result.data.length).to.equal(count)
+            result.data.forEach((row, i) => {
+              expect(row[1]).to.equal(100 + i)
+              expect(row[2]).to.equal(200 + i)
+              expect(row[3]).to.equal(10 + i)
+              expect(row[4]).to.equal(20 + i)
+            })
+          }),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('Returns positions split by source when sourcePolicy is all', async () => {
+      const base = new Date('2023-02-03T00:00:00.000Z')
+      const stepMs = 10_000
+      const count = 5
+      const SOURCE_A = 'source.a'
+      const SOURCE_B = 'source.b'
+
+      for (let i = 0; i < count; i++) {
+        const ts = new Date(base.getTime() + i * stepMs)
+        ;[
+          {
+            source: SOURCE_A,
+            position: { latitude: 60 + i * 0.001, longitude: 24 + i * 0.001 },
+          },
+          {
+            source: SOURCE_B,
+            position: { latitude: 61 + i * 0.001, longitude: 25 + i * 0.001 },
+          },
+        ].forEach(({ source, position }) =>
+          app.signalk.emit('delta', {
+            context: TESTCONTEXT,
+            updates: [
+              {
+                $source: source,
+                timestamp: ts,
+                values: [{ path: 'navigation.position' as Path, value: position }],
+              },
+            ],
+          }),
+        )
+      }
+
+      await plugin.flush()
+
+      const historyProvider = new InfluxHistoryProvider(plugin.skInfluxes()[0], selfId, app.debug)
+      const query = {
+        from: Temporal.Instant.from('2023-02-03T00:00:00Z'),
+        to: Temporal.Instant.from('2023-02-03T00:05:00Z'),
+        context: TESTCONTEXT as Context,
+        resolution: 10,
+        sourcePolicy: 'all' as const,
+        pathSpecs: [
+          {
+            path: 'navigation.position' as Path,
+            aggregate: 'first' as const,
+            parameter: [],
+          },
+        ],
+      }
+
+      return retry(
+        () =>
+          historyProvider.getValues(query).then((result) => {
+            expect(result.values).to.deep.equal([
+              { path: 'navigation.position', method: 'first', $source: SOURCE_A },
+              { path: 'navigation.position', method: 'first', $source: SOURCE_B },
+            ])
+            expect(result.data.length).to.equal(count)
+            result.data.forEach((row, i) => {
+              expect(row[0]).to.equal(new Date(base.getTime() + i * stepMs).toISOString())
+              expect(row[1]).to.deep.equal([24 + i * 0.001, 60 + i * 0.001])
+              expect(row[2]).to.deep.equal([25 + i * 0.001, 61 + i * 0.001])
+            })
+          }),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('Rejects preferred sourcePolicy because historical preferred-source resolution is not implemented', async () => {
+      const historyProvider = new InfluxHistoryProvider(plugin.skInfluxes()[0], selfId, app.debug)
+      const query = {
+        from: Temporal.Instant.from('2023-02-02T00:00:00Z'),
+        to: Temporal.Instant.from('2023-02-02T00:05:00Z'),
+        context: TESTCONTEXT as Context,
+        resolution: 10,
+        sourcePolicy: 'preferred' as const,
+        pathSpecs: [
+          {
+            path: 'navigation.speedThroughWater' as Path,
+            aggregate: 'max' as const,
+            parameter: [],
+          },
+        ],
+      }
+
+      try {
+        await historyProvider.getValues(query as unknown as ValuesRequest)
+        throw new Error('Expected sourcePolicy=preferred to fail')
+      } catch (error) {
+        expect((error as Error).message).to.contain("sourcePolicy='preferred' is not implemented")
+      }
     })
   })
 
@@ -1217,6 +1544,167 @@ describe('Plugin', () => {
       // Context in response should be the actual self context, not 'vessels.self'
       expect(result.context).to.equal(TESTCONTEXT)
       expect(result.data.length).to.be.greaterThan(0)
+    })
+  })
+
+  describe('stop()', () => {
+    beforeEach(async () => {
+      bucket = `test_bucket_stop_${Date.now()}`
+      plugin = InfluxPluginFactory(app)
+      await plugin.start({
+        influxes: [
+          {
+            url: `http://${INFLUX_HOST}:8086`,
+            token: 'signalk_token',
+            org: 'signalk_org',
+            bucket,
+            onlySelf: false,
+            writeOptions: {
+              // Large enough that the point below stays in the write
+              // client's buffer instead of being auto-flushed by batch
+              // size, and a flush interval long enough that the periodic
+              // timer can't fire before the test calls stop().
+              batchSize: 1000,
+              flushInterval: 60_000,
+              maxRetries: 1,
+            },
+            filteringRules: [],
+            ignoredPaths: [],
+            ignoredSources: [],
+            useSKTimestamp: false,
+            resolution: 0,
+          },
+        ],
+        outputDailyLog: false,
+      })
+    })
+
+    it('flushes buffered points instead of losing them', async () => {
+      app.signalk.emit('delta', {
+        context: TESTCONTEXT,
+        updates: [
+          {
+            $source: TESTSOURCE,
+            timestamp: new Date('2022-08-17T17:01:00Z'),
+            values: [
+              {
+                path: TESTPATHNUMERIC,
+                value: TESTNUMERICVALUE,
+              },
+            ],
+          },
+        ],
+      })
+
+      // No explicit flush() before stop() -- stop() itself must flush the
+      // pending write buffer, otherwise this point would be lost.
+      await plugin.stop()
+
+      return retry(
+        () =>
+          plugin
+            .getSelfValues({
+              paths: [TESTPATHNUMERIC],
+              influxIndex: 0,
+            })
+            .then((rows) => expect(rows.length).to.equal(1)),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('stops the delta listener even though flush() runs asynchronously', async () => {
+      const before = app.signalk.listenerCount('delta')
+      await plugin.stop()
+      expect(app.signalk.listenerCount('delta')).to.equal(before - 1)
+    })
+
+    it('unregisters the history API provider', async () => {
+      const before = unregisterHistoryApiProviderCallCount
+      await plugin.stop()
+      expect(unregisterHistoryApiProviderCallCount).to.equal(before + 1)
+    })
+  })
+
+  describe('Bucket name with forward slash', () => {
+    let slashBucket: string
+    let slashPlugin: Plugin & InfluxPlugin
+
+    beforeEach(async () => {
+      slashBucket = `test/bucket/${Date.now()}`
+      slashPlugin = InfluxPluginFactory(app)
+      await slashPlugin.start({
+        influxes: [
+          {
+            url: `http://${INFLUX_HOST}:8086`,
+            token: 'signalk_token',
+            org: 'signalk_org',
+            bucket: slashBucket,
+            onlySelf: false,
+            writeOptions: {
+              batchSize: 1,
+              flushInterval: 10,
+              maxRetries: 1,
+            },
+            filteringRules: [],
+            ignoredPaths: [],
+            ignoredSources: [],
+            useSKTimestamp: false,
+            resolution: 0,
+          },
+        ],
+        outputDailyLog: false,
+      })
+    })
+
+    afterEach(() => {
+      slashPlugin.stop()
+    })
+
+    it('writes and reads data with forward slash in bucket name', async () => {
+      app.signalk.emit('delta', {
+        context: TESTCONTEXT,
+        updates: [
+          {
+            $source: TESTSOURCE,
+            timestamp: new Date('2022-08-17T17:01:00Z'),
+            values: [
+              {
+                path: TESTPATHNUMERIC,
+                value: TESTNUMERICVALUE,
+              },
+            ],
+          },
+        ],
+      })
+
+      return retry(
+        () =>
+          slashPlugin.flush().then(() =>
+            slashPlugin
+              .getSelfValues({
+                paths: [TESTPATHNUMERIC],
+                influxIndex: 0,
+              })
+              .then((rows) => {
+                expect(rows.length).to.equal(1)
+              }),
+          ),
+        [null],
+        {
+          retriesMax: 5,
+          interval: 50,
+        },
+      )
+    })
+
+    it('uses sanitized v1 database name', () => {
+      const influx = slashPlugin.skInfluxes()[0]
+      expect(influx.v1DatabaseName).to.equal(bucketToV1DatabaseName(slashBucket))
+      expect(influx.v1DatabaseName).to.not.include('/')
     })
   })
 })

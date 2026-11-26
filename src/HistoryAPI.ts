@@ -2,8 +2,7 @@ import { DateTimeFormatter, LocalDate, ZoneId, ZonedDateTime } from '@js-joda/co
 
 import { SKInflux } from './influx'
 import { InfluxDB as InfluxV1 } from 'influx'
-import { FluxResultObserver, FluxTableMetaData } from '@influxdata/influxdb-client'
-import { Context, Path, Timestamp } from '@signalk/server-api'
+import { Context, Path, SourceRef, Timestamp } from '@signalk/server-api'
 import {
   AggregateMethod,
   DataRow,
@@ -18,6 +17,7 @@ import {
 } from '@signalk/server-api/history'
 
 export type DataResult = Omit<ValuesResponse, 'context' | 'range'>
+type SourcePolicy = 'preferred' | 'all'
 
 const DEFAULT_EMA_PERIOD = 5
 
@@ -35,14 +35,6 @@ function resolveEmaParams(spec: PathSpec): { period: number; alpha: number } {
   return { period, alpha }
 }
 
-function makeArray(d1: number, d2: number) {
-  const arr = []
-  for (let i = 0; i < d1; i++) {
-    arr.push(new Array(d2))
-  }
-  return arr
-}
-
 export class InfluxHistoryProvider implements HistoryApi {
   constructor(private influx: SKInflux, private selfId: string, private debug: (k: string) => void) {}
 
@@ -53,17 +45,35 @@ export class InfluxHistoryProvider implements HistoryApi {
     const resolution = query.resolution || (to.toEpochSecond() - from.toEpochSecond()) / 1000
 
     // Convert pathSpecs to the format expected by internal functions
-    const pathSpecs: PathSpec[] = query.pathSpecs.map((spec) => ({
-      path: spec.path,
-      queryResultName: spec.path.replace(/\./g, '_'),
-      aggregateMethod: spec.aggregate,
-      aggregateFunction: (functionForAggregate[spec.aggregate] as string) || 'mean',
-      parameters: spec.parameter || [],
-    }))
+    let pathSpecs: PathSpec[] = query.pathSpecs.map((spec) => {
+      // sourceRef is part of the History API spec but may be absent from the
+      // installed @signalk/server-api typings, hence the cast.
+      const sourceRef = (spec as { sourceRef?: SourceRef }).sourceRef
+      return {
+        path: spec.path,
+        queryResultName: spec.path.replace(/\./g, '_'),
+        aggregateMethod: spec.aggregate,
+        aggregateFunction: (functionForAggregate[spec.aggregate] as string) || 'mean',
+        parameters: spec.parameter || [],
+        ...(sourceRef ? { sourceRef } : {}),
+      }
+    })
 
-    const positionPathSpecs = pathSpecs.filter(({ path }) => path === 'navigation.position').slice(0, 1)
+    const sourcePolicy = (query as unknown as { sourcePolicy?: SourcePolicy }).sourcePolicy
+    if (sourcePolicy === 'preferred') {
+      throw new Error(
+        "sourcePolicy='preferred' is not implemented by signalk-to-influxdb2; omit sourcePolicy for provider default behavior or use sourcePolicy='all'",
+      )
+    }
+
+    const sourcePolicyAll = sourcePolicy === 'all'
+    if (sourcePolicyAll) {
+      pathSpecs = await expandPathSpecsBySource(this.influx, context, from, to, pathSpecs, this.debug)
+    }
+
+    const positionPathSpecs = pathSpecs.filter(({ path }) => path === 'navigation.position')
+    const requestedPositionPathSpecs = sourcePolicyAll ? positionPathSpecs : positionPathSpecs.slice(0, 1)
     const nonPositionPathSpecs = pathSpecs.filter(({ path }) => path !== 'navigation.position')
-    const needsCollation = nonPositionPathSpecs.length > 0 && positionPathSpecs.length > 0
 
     // Calculate extended query window for SMA and EMA
     const maxSmaWindow = nonPositionPathSpecs.reduce((max, spec) => {
@@ -89,8 +99,26 @@ export class InfluxHistoryProvider implements HistoryApi {
     // Extend the start time backwards to get enough data for SMA/EMA calculation
     const extendedFrom = maxWindow > 0 ? from.minusNanos(maxWindow * resolution * 1000 * 1_000_000) : from
 
-    const positionResult = positionPathSpecs.length
-      ? getPositions(this.influx.v1Client, context, from, to, resolution * 1000, needsCollation, this.debug)
+    const positionResult = requestedPositionPathSpecs.length
+      ? sourcePolicyAll
+        ? getPositionValues(
+            this.influx.v1Client,
+            context,
+            from,
+            to,
+            resolution * 1000,
+            requestedPositionPathSpecs,
+            this.debug,
+          )
+        : getPositions(
+            this.influx.v1Client,
+            context,
+            from,
+            to,
+            resolution * 1000,
+            this.debug,
+            requestedPositionPathSpecs[0].sourceRef,
+          )
       : Promise.resolve({
           values: [],
           data: [],
@@ -104,7 +132,6 @@ export class InfluxHistoryProvider implements HistoryApi {
           to,
           resolution * 1000,
           nonPositionPathSpecs,
-          needsCollation,
           '',
           this.debug,
         )
@@ -125,42 +152,7 @@ export class InfluxHistoryProvider implements HistoryApi {
       )
     }
 
-    if (
-      posResult.data.length > 0 &&
-      processedNonPosResult.data.length > 0 &&
-      posResult.data.length !== processedNonPosResult.data.length
-    ) {
-      throw new Error('Query result lengths do not match')
-    }
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let data: any[] = []
-    let values: ValueList = []
-
-    if (posResult.data.length > 0) {
-      data = posResult.data
-      values = posResult.values
-      if (processedNonPosResult.data.length) {
-        values = values.concat(processedNonPosResult.values)
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars, @typescript-eslint/no-explicit-any
-        processedNonPosResult.data.forEach(([ts, ...numericValues]: any[], i: number) => {
-          let hasNonNulls = data[i][1][0] !== null //first coordinate of position is not null
-          numericValues.forEach((value) => (hasNonNulls = hasNonNulls || value !== null))
-          if (hasNonNulls) {
-            data[i].push(...numericValues)
-          }
-        })
-        //filter out rows with all null values
-        data = data.filter((row) => row.length !== pathSpecs.length)
-      } else {
-        //only positions, check that first coordinate is not null
-        data = data.filter((row) => row[1][0] !== null)
-      }
-    } else {
-      //filter out rows with all null values
-      data = processedNonPosResult.data.filter((row) => row.slice(1).some((value) => value !== null))
-      values = processedNonPosResult.values
-    }
+    const { values, data } = mergeResultsByTimestamp(posResult, processedNonPosResult)
 
     return {
       context,
@@ -346,20 +338,6 @@ function applyMovingAveragePostProcessing(
   }
 }
 
-interface ValuesResult {
-  context: string
-  range: {
-    from: string
-    to: string
-  }
-  values: {
-    path: string
-    method: string
-    source?: string
-  }[]
-  data: ValuesResultRow[]
-}
-
 interface SimpleResponse {
   status: (s: number) => void
   /* eslint-disable-next-line  @typescript-eslint/no-explicit-any */
@@ -376,18 +354,17 @@ interface SimpleRequest {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-type ValuesResultRow = any[]
-
 export function getPositions(
   v1Client: InfluxV1,
   context: string,
   from: ZonedDateTime,
   to: ZonedDateTime,
   timeResolutionMillis: number,
-  needsCollation: boolean,
   debug: (s: string) => void,
+  sourceRef?: SourceRef,
 ): Promise<DataResult> {
+  const sourceClause = sourceRef ? `\n    and\n    "source" = '${sourceRef}'` : ''
+
   const query = `
   select
     first(lat) as lat, first(lon) as lon
@@ -398,12 +375,102 @@ export function getPositions(
     and
     time >= '${from.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
     and
-   time <= '${to.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
-  group by time(${timeResolutionMillis}ms)${!needsCollation ? ' fill(none)' : ''}`
+   time <= '${to.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'${sourceClause}
+  group by time(${timeResolutionMillis}ms) fill(none)`
 
   debug(query)
 
-  return v1Client.query(query).then(toDataResult)
+  return v1Client.query(query).then((rows) => toDataResult(rows, sourceRef))
+}
+
+async function expandPathSpecsBySource(
+  influx: SKInflux,
+  context: Context,
+  from: ZonedDateTime,
+  to: ZonedDateTime,
+  pathSpecs: PathSpec[],
+  debug: (s: string) => void,
+): Promise<PathSpec[]> {
+  const expanded: PathSpec[] = []
+
+  for (const pathSpec of pathSpecs) {
+    if (pathSpec.sourceRef) {
+      expanded.push(pathSpec)
+      continue
+    }
+
+    const sourceRefs = await getSourceRefsForPath(influx, context, from, to, pathSpec.path, debug)
+    sourceRefs.forEach((sourceRef) => expanded.push({ ...pathSpec, sourceRef }))
+  }
+
+  return expanded
+}
+
+function getSourceRefsForPath(
+  influx: SKInflux,
+  context: Context,
+  from: ZonedDateTime,
+  to: ZonedDateTime,
+  path: Path,
+  debug: (s: string) => void,
+): Promise<SourceRef[]> {
+  const countField = path === 'navigation.position' ? 'lat' : 'value'
+  const query = `
+  select
+    count(${countField}) as sample_count
+  from
+    "${path}"
+  where
+    "context" = '${context}'
+    and
+    time >= '${from.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
+    and
+   time <= '${to.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
+  group by "source"`
+
+  debug(query)
+
+  return influx.v1Client.query(query).then((result) => sourceRefsFromInfluxResult(result as InfluxSourceResult))
+}
+
+interface InfluxSourceRow {
+  source?: unknown
+}
+
+interface InfluxSourceGroup {
+  tags?: {
+    source?: unknown
+  }
+  rows?: InfluxSourceRow[]
+}
+
+type InfluxSourceResult = InfluxSourceRow[] & {
+  groups?: () => InfluxSourceGroup[]
+}
+
+function sourceRefsFromInfluxResult(result: InfluxSourceResult): SourceRef[] {
+  const sourceRefs = new Set<SourceRef>()
+
+  result.forEach((row) => {
+    if (typeof row.source === 'string') {
+      sourceRefs.add(row.source as SourceRef)
+    }
+  })
+
+  if (typeof result.groups === 'function') {
+    result.groups().forEach((group) => {
+      if (typeof group.tags?.source === 'string') {
+        sourceRefs.add(group.tags.source as SourceRef)
+      }
+      group.rows?.forEach((row) => {
+        if (typeof row.source === 'string') {
+          sourceRefs.add(row.source as SourceRef)
+        }
+      })
+    })
+  }
+
+  return Array.from(sourceRefs).sort()
 }
 
 export function getValues(
@@ -420,32 +487,21 @@ export function getValues(
     (req.query.resolution
       ? Number.parseFloat(req.query.resolution as string)
       : (to.toEpochSecond() - from.toEpochSecond()) / 1000) * 1000
-  const pathExpressions = ((req.query.paths as string) || '').replace(/[^0-9a-z.,:]/gi, '').split(',')
+  const pathExpressions = ((req.query.paths as string) || '').replace(/[^0-9a-z.,:|]/gi, '').split(',')
   const pathSpecs: PathSpec[] = pathExpressions.map(splitPathExpression)
 
   const positionPathSpecs = pathSpecs.filter(({ path }) => path === 'navigation.position').slice(0, 1)
   const nonPositionPathSpecs = pathSpecs.filter(({ path }) => path !== 'navigation.position')
-  const needsCollation = nonPositionPathSpecs.length > 0 && positionPathSpecs.length > 0
 
   const positionResult = positionPathSpecs.length
-    ? getPositions(influx.v1Client, context, from, to, timeResolutionMillis, needsCollation, debug)
+    ? getPositions(influx.v1Client, context, from, to, timeResolutionMillis, debug, positionPathSpecs[0].sourceRef)
     : Promise.resolve({
         values: [],
         data: [],
       })
 
   const nonPositionResult: Promise<DataResult> = nonPositionPathSpecs.length
-    ? getNumericValues(
-        influx,
-        context,
-        from,
-        to,
-        timeResolutionMillis,
-        nonPositionPathSpecs,
-        needsCollation,
-        format,
-        debug,
-      )
+    ? getNumericValues(influx, context, from, to, timeResolutionMillis, nonPositionPathSpecs, format, debug)
     : Promise.resolve({
         values: [],
         data: [],
@@ -570,6 +626,107 @@ export function getValues(
     })
 }
 
+// Builds the `values` descriptor list for a set of path specs, including the
+// $source only when one was requested for that path.
+function valuesForSpecs(pathSpecs: PathSpec[]): ValueList {
+  return pathSpecs.map(({ path, aggregateMethod, sourceRef }: PathSpec) => ({
+    path,
+    method: aggregateMethod,
+    ...(sourceRef ? { $source: sourceRef } : {}),
+  }))
+}
+
+function getPositionValues(
+  v1Client: InfluxV1,
+  context: Context,
+  from: ZonedDateTime,
+  to: ZonedDateTime,
+  timeResolutionMillis: number,
+  pathSpecs: PathSpec[],
+  debug: (s: string) => void,
+): Promise<DataResult> {
+  if (pathSpecs.length <= 1) {
+    return getPositions(v1Client, context, from, to, timeResolutionMillis, debug, pathSpecs[0]?.sourceRef)
+  }
+
+  const queries = pathSpecs.map((pathSpec, index) =>
+    getPositions(v1Client, context, from, to, timeResolutionMillis, debug, pathSpec.sourceRef).then((result) => ({
+      result,
+      index,
+    })),
+  )
+
+  return Promise.all(queries).then((results) => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dataByTs = new Map<string, any[]>()
+
+    results.forEach(({ result, index }) => {
+      result.data.forEach((row) => {
+        const ts = row[0] as string
+        let target = dataByTs.get(ts)
+        if (!target) {
+          target = new Array(pathSpecs.length + 1).fill(null)
+          target[0] = ts
+          dataByTs.set(ts, target)
+        }
+        target[index + 1] = row[1] ?? null
+      })
+    })
+
+    return {
+      values: valuesForSpecs(pathSpecs),
+      data: Array.from(dataByTs.values()).sort((a, b) => String(a[0]).localeCompare(String(b[0]))) as DataRow[],
+    }
+  })
+}
+
+function mergeResultsByTimestamp(posResult: DataResult, nonPosResult: DataResult): DataResult {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dataByTs = new Map<string, any[]>()
+  const values = posResult.values.concat(nonPosResult.values)
+  const valueCount = values.length
+
+  addResultRows(dataByTs, posResult, 0, valueCount)
+  addResultRows(dataByTs, nonPosResult, posResult.values.length, valueCount)
+
+  const data = Array.from(dataByTs.values())
+    .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+    .filter((row) => row.slice(1).some(hasMeaningfulValue)) as DataRow[]
+
+  return { values, data }
+}
+
+function addResultRows(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  dataByTs: Map<string, any[]>,
+  result: DataResult,
+  offset: number,
+  valueCount: number,
+) {
+  result.data.forEach((sourceRow) => {
+    const ts = sourceRow[0] as string
+    let target = dataByTs.get(ts)
+
+    if (!target) {
+      target = new Array(valueCount + 1).fill(null)
+      target[0] = ts
+      dataByTs.set(ts, target)
+    }
+
+    for (let sourceIndex = 1; sourceIndex < sourceRow.length; sourceIndex++) {
+      target[offset + sourceIndex] = sourceRow[sourceIndex] ?? null
+    }
+  })
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function hasMeaningfulValue(value: any): boolean {
+  if (Array.isArray(value)) {
+    return value.some(hasMeaningfulValue)
+  }
+  return value !== null && value !== undefined
+}
+
 function getNumericValues(
   influx: SKInflux,
   context: Context,
@@ -577,9 +734,97 @@ function getNumericValues(
   to: ZonedDateTime,
   timeResolutionMillis: number,
   pathSpecs: PathSpec[],
-  needsCollation: boolean,
   format: string,
   debug: (s: string) => void,
+): Promise<DataResult> {
+  const distinctSourceRefs = new Set(pathSpecs.map((ps) => ps.sourceRef))
+  const distinctPaths = new Set(pathSpecs.map((ps) => ps.path))
+  const distinctAggregates = new Set(pathSpecs.map((ps) => ps.aggregateFunction))
+
+  // Legacy unfiltered queries keep the old single-query behaviour. A
+  // source-specific query with multiple measurements is split below because
+  // InfluxQL result collation across measurements is not stable enough for
+  // reconstructing the requested column order. Different aggregates must
+  // also be split: InfluxQL applies each SELECT expression to every path.
+  const sourceRef = pathSpecs[0]?.sourceRef
+  if (
+    distinctSourceRefs.size <= 1 &&
+    distinctAggregates.size === 1 &&
+    (sourceRef === undefined || distinctPaths.size === 1)
+  ) {
+    return querySourceGroup(influx, context, from, to, timeResolutionMillis, pathSpecs, debug, sourceRef)
+  }
+
+  // Collate separate source, path and aggregate groups by timestamp.
+  const groups = new Map<string, { specs: PathSpec[]; indices: number[] }>()
+  pathSpecs.forEach((ps, i) => {
+    const groupKey = JSON.stringify([ps.sourceRef, ps.sourceRef ? ps.path : null, ps.aggregateFunction])
+    let group = groups.get(groupKey)
+    if (!group) {
+      group = { specs: [], indices: [] }
+      groups.set(groupKey, group)
+    }
+    group.specs.push(ps)
+    group.indices.push(i)
+  })
+
+  if (groups.size === 1) {
+    return querySourceGroup(influx, context, from, to, timeResolutionMillis, pathSpecs, debug, pathSpecs[0].sourceRef)
+  }
+
+  const groupPromises = Array.from(groups.values()).map((group) =>
+    querySourceGroup(
+      influx,
+      context,
+      from,
+      to,
+      timeResolutionMillis,
+      group.specs,
+      debug,
+      group.specs[0].sourceRef,
+    ).then((result) => ({ result, indices: group.indices })),
+  )
+
+  return Promise.all(groupPromises).then((groupResults) => {
+    const allTimestamps = Array.from(
+      new Set(groupResults.flatMap(({ result }) => result.data.map((row) => row[0] as string))),
+    ).sort()
+    const rowByTs = new Map<string, DataRow>()
+    allTimestamps.forEach((ts) => {
+      rowByTs.set(ts, [ts as Timestamp, ...new Array(pathSpecs.length).fill(null)])
+    })
+
+    groupResults.forEach(({ result, indices }) => {
+      result.data.forEach((groupRow) => {
+        const ts = groupRow[0] as string
+        const target = rowByTs.get(ts)
+        if (!target) {
+          return
+        }
+        indices.forEach((originalIndex, groupColumn) => {
+          target[originalIndex + 1] = groupRow[groupColumn + 1] ?? null
+        })
+      })
+    })
+
+    return {
+      values: valuesForSpecs(pathSpecs),
+      data: allTimestamps.map((ts) => rowByTs.get(ts) as DataRow),
+    }
+  })
+}
+
+// Runs a single InfluxQL query for path specs that share one source and aggregate,
+// returning rows in the same column order as `pathSpecs`.
+function querySourceGroup(
+  influx: SKInflux,
+  context: Context,
+  from: ZonedDateTime,
+  to: ZonedDateTime,
+  timeResolutionMillis: number,
+  pathSpecs: PathSpec[],
+  debug: (s: string) => void,
+  sourceRef?: SourceRef,
 ): Promise<DataResult> {
   const start = Date.now()
 
@@ -589,16 +834,11 @@ function getNumericValues(
     }
     return acc
   }, [])
-  const uniqueAggregates = pathSpecs.reduce<string[]>((acc, ps) => {
-    if (acc.indexOf(ps.aggregateFunction) === -1) {
-      acc.push(ps.aggregateFunction)
-    }
-    return acc
-  }, [])
+  const sourceClause = sourceRef ? `\n    and\n    "source" = '${sourceRef}'` : ''
 
   const query = `
   select
-    ${uniqueAggregates.map((aggregateFunction) => `${aggregateFunction}(value)`).join(',')}
+    ${pathSpecs[0].aggregateFunction}(value)
   from
     ${uniquePaths.map((s) => `"${s}"`).join(',')}
   where
@@ -606,144 +846,31 @@ function getNumericValues(
     and
     time >= '${from.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
     and
-   time <= '${to.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'
-  group by time(${timeResolutionMillis}ms)${!needsCollation ? ' fill(none)' : ''}`
+   time <= '${to.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z'${sourceClause}
+  group by time(${timeResolutionMillis}ms) fill(none)`
   debug(query)
 
   return influx.v1Client.query(query).then((result) => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const rows = result as any[]
-    debug(`got ${rows.length} rows in ${Date.now() - start}ms`)
-    const resultLength = rows.length
-    const resultData = makeArray(resultLength, pathSpecs.length + 1)
-
-    for (let j = 0; j < resultLength; j++) {
-      resultData[j][0] = rows[j].time.toISOString()
-    }
+    debug(`got ${result.length} rows in ${Date.now() - start}ms`)
+    const rowByTs = new Map<string, DataRow>()
 
     result.groups().forEach((group) => {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const groupPathSpecs = pathSpecs.reduce<any[]>((acc, ps, i) => {
-        if (ps.path === group.name) {
-          acc.push([i + 1, ps.aggregateFunction])
-        }
-        return acc
-      }, [])
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      group.rows.forEach((row: any, i) => {
-        groupPathSpecs.forEach(([fieldIndex, fieldName]) => {
-          resultData[i][fieldIndex] = row[fieldName]
+      const indices = pathSpecs.flatMap((ps, i) => (ps.path === group.name ? [i + 1] : []))
+      group.rows.forEach((row) => {
+        const timestamp = row.time.toISOString()
+        const dataRow = rowByTs.get(timestamp) || [timestamp as Timestamp, ...new Array(pathSpecs.length).fill(null)]
+        indices.forEach((fieldIndex) => {
+          dataRow[fieldIndex] = (row as Record<string, unknown>)[pathSpecs[0].aggregateFunction] ?? null
         })
+        rowByTs.set(timestamp, dataRow as DataRow)
       })
     })
     debug(`rows done ${Date.now() - start}ms`)
     return {
-      values: pathSpecs.map(({ path, aggregateMethod }: PathSpec) => ({ path, method: aggregateMethod })),
-      data: resultData as DataRow[],
+      values: valuesForSpecs(pathSpecs),
+      data: Array.from(rowByTs.values()).sort((a, b) => a[0].localeCompare(b[0])),
     }
   })
-}
-
-export async function getValuesFlux(
-  influx: SKInflux,
-  context: string,
-  from: ZonedDateTime,
-  to: ZonedDateTime,
-  debug: (s: string) => void,
-  req: SimpleRequest,
-  res: SimpleResponse,
-): Promise<ValuesResult | void> {
-  const timeResolutionMillis =
-    (req.query.resolution
-      ? Number.parseFloat(req.query.resolution as string)
-      : (to.toEpochSecond() - from.toEpochSecond()) / 500) * 1000
-
-  const pathExpressions = ((req.query.paths as string) || '').replace(/[^0-9a-z.,:]/gi, '').split(',')
-  const pathSpecs: PathSpec[] = pathExpressions.map(splitPathExpression)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const resultData: any[] = []
-
-  const measurements = pathSpecs
-    .map(
-      ({ path, aggregateFunction, queryResultName }, i) => `
-  dataForContext
-  |> filter(fn: (r) => r._measurement == "${path}")
-  |> aggregateWindow(every: ${timeResolutionMillis.toFixed(0)}ms, fn: ${aggregateFunction})
-  |> yield(name: "${queryResultName + i}")
-  `,
-    )
-    .join('\n')
-  let query = `
-    dataForContext = from(bucket: "${influx.bucket}")
-    |> range(start: ${from.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z, stop: ${to.format(
-    DateTimeFormatter.ISO_LOCAL_DATE_TIME,
-  )}Z)
-    |> filter(fn: (r) => r.context == "${context}")
-
-    ${measurements}
-    `
-
-  if (pathSpecs[0].path === 'navigation.position') {
-    query = `
-    from(bucket: "${influx.bucket}")
-    |> range(start: ${from.format(DateTimeFormatter.ISO_LOCAL_DATE_TIME)}Z, stop: ${to.format(
-      DateTimeFormatter.ISO_LOCAL_DATE_TIME,
-    )}Z)
-    |> filter(fn: (r) =>
-      r.context == "${context}" and
-      r._measurement == "navigation.position" and (r._field == "lat" or r._field == "lon") )
-    |> aggregateWindow(every: ${timeResolutionMillis.toFixed(0)}ms, fn: first)
-    |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-    |> keep(columns: ["_time", "lat", "lon"])
-    |> sort(columns:["_time"])
-    `
-  }
-  debug(query)
-
-  const queryResultNames = pathSpecs.map(({ queryResultName }, i) => `${queryResultName + i}`)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const resultTimes: Record<any, number> = {}
-  let i = 0
-  let j = 0
-
-  const start = Date.now()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const o: FluxResultObserver<any> = {
-    next: (row: string[], tableMeta: FluxTableMetaData) => {
-      if (j++ === 0) {
-        debug(`start  ${Date.now() - start}`)
-      }
-      const time = tableMeta.get(row, '_time')
-      if (resultTimes[time] === undefined) {
-        resultTimes[time] = i++
-        resultData.push([time])
-      }
-      const result = tableMeta.get(row, 'result')
-      const value = tableMeta.get(row, '_value')
-      const fieldIndex = queryResultNames.indexOf(result)
-      resultData[resultTimes[time]][fieldIndex + 1] = value
-      return true
-    },
-    error: (s: Error) => {
-      console.error(s.message)
-      console.error(query)
-      res.status(500)
-      res.json(s)
-    },
-    complete: () => {
-      debug(`complete ${Date.now() - start}`)
-      res.json({
-        context,
-        range: {
-          from: from.toString() as Timestamp,
-          to: to.toString() as Timestamp,
-        },
-        values: pathSpecs.map(({ path, aggregateMethod }: PathSpec) => ({ path, method: aggregateMethod })),
-        data: resultData,
-      })
-    },
-  }
-  influx.queryApi.queryRows(query, o)
 }
 
 interface PathSpec {
@@ -752,10 +879,21 @@ interface PathSpec {
   aggregateMethod: AggregateMethod
   aggregateFunction: string
   parameters: string[]
+  sourceRef?: SourceRef
 }
 
+// A `|sourceRef` suffix on a path expression filters that path to a single
+// source, e.g. 'navigation.speedOverGround:max|n2k-on-ve.can0.115'.
 function splitPathExpression(pathExpression: string): PathSpec {
-  const parts = pathExpression.split(':')
+  const pipeIdx = pathExpression.indexOf('|')
+  let sourceRef: SourceRef | undefined
+  let expr = pathExpression
+  if (pipeIdx >= 0) {
+    sourceRef = pathExpression.substring(pipeIdx + 1) as SourceRef
+    expr = pathExpression.substring(0, pipeIdx)
+  }
+
+  const parts = expr.split(':')
   let aggregateMethod = (parts[1] || 'average') as AggregateMethod
   if (parts[0] === 'navigation.position') {
     aggregateMethod = 'first' as AggregateMethod
@@ -766,6 +904,7 @@ function splitPathExpression(pathExpression: string): PathSpec {
     aggregateMethod,
     aggregateFunction: (functionForAggregate[aggregateMethod] as string) || 'mean()',
     parameters: [],
+    ...(sourceRef ? { sourceRef } : {}),
   }
 }
 
@@ -777,9 +916,9 @@ function outputPositionsGpx(data: DataResult, context: string, res: SimpleRespon
   <trk>`
   let inSegment = false
   data.data.forEach((dr) => {
-    const p = dr as [Timestamp, [number, number]]
+    const p = dr as [Timestamp, [number, number] | null]
     const [time, position] = p
-    const [lon, lat] = position
+    const [lon, lat] = position || [null, null]
     if (lat !== null && lon !== null) {
       if (!inSegment) {
         responseBody += '\n<trkseg>'
@@ -803,12 +942,18 @@ function outputPositionsGpx(data: DataResult, context: string, res: SimpleRespon
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function toDataResult(rows: any[]): DataResult {
+function toDataResult(rows: any[], sourceRef?: SourceRef): DataResult {
   const resultData = rows.map<DataRow>((row) => {
-    return [row.time.toISOString(), [row.lon, row.lat]]
+    return [row.time.toISOString(), row.lon == null || row.lat == null ? null : [row.lon, row.lat]]
   })
   return {
-    values: [{ path: 'navigation.position' as Path, method: 'first' as AggregateMethod }],
+    values: [
+      {
+        path: 'navigation.position' as Path,
+        method: 'first' as AggregateMethod,
+        ...(sourceRef ? { $source: sourceRef } : {}),
+      },
+    ],
     data: resultData,
   }
 }
@@ -818,6 +963,7 @@ const functionForAggregate: { [key: string]: string } = {
   min: 'min',
   max: 'max',
   first: 'first',
+  last: 'last',
   sma: 'mean', // Use mean from DB, then apply SMA post-processing
   ema: 'mean', // Use mean from DB, then apply EMA post-processing
 }
